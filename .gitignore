@@ -1,0 +1,18 @@
+# Build output
+*.nvda-addon
+
+# Vendor reference material (binary blobs / GPL source kept locally for
+# research only — not part of this add-on's source)
+m30245_starter_kit.inf/
+win7/
+braille.c
+brldefs-mt.h
+Makefile.in
+_libusb/
+
+# Local tool config
+.claude/
+
+# Python
+__pycache__/
+*.pyc

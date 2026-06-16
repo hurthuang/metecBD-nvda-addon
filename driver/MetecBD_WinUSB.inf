@@ -1,0 +1,41 @@
+; MetecBD_WinUSB.inf
+; WinUSB driver association for Metec BD / M30245 Starter Kit braille display
+;
+; Manual install (run as Administrator):
+;   pnputil /add-driver MetecBD_WinUSB.inf /install
+;
+; After installation, the device will be accessible via libusb-1.0 / WinUSB API.
+; The previous Zadig-installed libusb driver will be replaced with this one.
+; If you already have Zadig's WinUSB installed, this INF is not required.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGUID   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ManufacturerName%
+DriverVer   = 06/15/2026,1.0.0.0
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = USB_Install,USB\VID_0452&PID_0100
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include    = winusb.inf
+AddService = WinUSB,0x00000002,WinUSB_ServiceInstall
+
+[USB_Install.HW]
+AddReg = Dev_AddReg
+
+[Dev_AddReg]
+; DeviceInterfaceGUID is used by libusb-1.0 to locate the device.
+HKR,,DeviceInterfaceGUIDs,0x10000,"{A9FDBB24-B8C0-4E55-B849-C9FD3A5E01FF}"
+
+[Strings]
+ManufacturerName = "Metec AG"
+DeviceName       = "Metec BD Braille Display (WinUSB)"
