@@ -6,7 +6,7 @@ have WinUSB as its driver service.
 """
 
 import os
-import ctypes
+import subprocess
 import winreg
 
 import gui
@@ -18,29 +18,6 @@ _INF_PATH  = os.path.join(_ADDON_DIR, "driver", "MetecBD_WinUSB.inf")
 
 VENDOR_ID  = 0x0452
 PRODUCT_ID = 0x0100
-
-SEE_MASK_NOCLOSEPROCESS = 0x00000040
-SW_HIDE = 0
-
-
-class SHELLEXECUTEINFOW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize",          ctypes.c_ulong),
-        ("fMask",           ctypes.c_ulong),
-        ("hwnd",            ctypes.c_void_p),
-        ("lpVerb",          ctypes.c_wchar_p),
-        ("lpFile",          ctypes.c_wchar_p),
-        ("lpParameters",    ctypes.c_wchar_p),
-        ("lpDirectory",     ctypes.c_wchar_p),
-        ("nShow",           ctypes.c_int),
-        ("hInstApp",        ctypes.c_void_p),
-        ("lpIDList",        ctypes.c_void_p),
-        ("lpClass",         ctypes.c_wchar_p),
-        ("hkeyClass",       ctypes.c_void_p),
-        ("dwHotKey",        ctypes.c_ulong),
-        ("hIconOrMonitor",  ctypes.c_void_p),
-        ("hProcess",        ctypes.c_void_p),
-    ]
 
 
 def _winusb_already_installed() -> bool:
@@ -72,40 +49,48 @@ def _winusb_already_installed() -> bool:
     return False
 
 
-def _run_pnputil_elevated(args: str, timeout_ms: int = 30000):
-    """
-    Run pnputil with elevation, waiting for it to finish, and return its
-    real exit code (0 = success). Uses ShellExecuteExW with verb="runas":
-    this shows a UAC prompt only if the current process isn't already
-    elevated. Returns None if the user cancelled the UAC prompt or the
-    process could not be launched at all.
-    """
-    sei = SHELLEXECUTEINFOW()
-    sei.cbSize = ctypes.sizeof(sei)
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS
-    sei.hwnd = None
-    sei.lpVerb = "runas"
-    sei.lpFile = "pnputil.exe"
-    sei.lpParameters = args
-    sei.lpDirectory = None
-    sei.nShow = SW_HIDE
-    sei.hInstApp = None
+def _ps_quote(s: str) -> str:
+    """Quote a string as a single-quoted PowerShell literal."""
+    return "'" + s.replace("'", "''") + "'"
 
-    ok = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
-    if not ok or not sei.hProcess:
+
+def _run_pnputil_elevated(timeout_s: int = 40):
+    """
+    Run "pnputil /add-driver <inf> /install" elevated, waiting for it to
+    finish, and return its real exit code (0 = success).
+
+    Uses PowerShell's "Start-Process -Verb RunAs -Wait -PassThru" instead
+    of hand-rolled ShellExecuteEx/ctypes: it reliably triggers UAC (or
+    silently elevates if we're already admin), blocks until the process
+    exits, and exposes the real exit code via $p.ExitCode. Returns None
+    if the UAC prompt was cancelled or PowerShell itself could not be
+    launched.
+    """
+    ps_cmd = (
+        "$p = Start-Process -FilePath pnputil.exe "
+        f"-ArgumentList '/add-driver',{_ps_quote(_INF_PATH)},'/install' "
+        "-Verb RunAs -Wait -PassThru -WindowStyle Hidden; "
+        "exit $p.ExitCode"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            timeout=timeout_s,
+        )
+    except Exception:
+        log.exception("MetecBD installTasks: failed to launch elevated pnputil")
         return None
-
-    ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, timeout_ms)
-    exit_code = ctypes.c_ulong(0)
-    ctypes.windll.kernel32.GetExitCodeProcess(
-        sei.hProcess, ctypes.byref(exit_code))
-    ctypes.windll.kernel32.CloseHandle(sei.hProcess)
-    return exit_code.value
+    return result.returncode
 
 
 def _install_winusb():
-    args = f'/add-driver "{_INF_PATH}" /install'
-    exit_code = _run_pnputil_elevated(args)
+    try:
+        exit_code = _run_pnputil_elevated()
+    except Exception:
+        log.exception("MetecBD installTasks: unexpected error during driver install")
+        _show_manual_install_message()
+        return
     log.info(f"MetecBD installTasks: pnputil /add-driver exit_code={exit_code}")
 
     if exit_code == 0:
