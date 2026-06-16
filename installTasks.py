@@ -142,14 +142,26 @@ def onInstall():
         return
 
     def _prompt():
-        result = gui.messageBox(
-            "MetecBD add-on 需要為 Metec BD 點字顯示器安裝 WinUSB 驅動程式。\n"
-            "（這是一次性操作，需要系統管理員權限，會出現 UAC 視窗。）\n\n"
-            "立即安裝嗎？",
-            "MetecBD - 驅動程式安裝",
-            wx.YES_NO | wx.ICON_QUESTION,
-        )
-        if result == wx.ID_YES:
-            _install_winusb()
+        try:
+            # gui.messageBox's return value is no longer guaranteed to be a
+            # stock wx.ID_* constant on newer NVDA (observed returning its
+            # own internal enum, e.g. 2 for "Yes" instead of wx.ID_YES).
+            # Use a plain wx.MessageDialog so ShowModal()'s return code is
+            # always the genuine wx.ID_YES / wx.ID_NO.
+            dlg = wx.MessageDialog(
+                gui.mainFrame,
+                "MetecBD add-on 需要為 Metec BD 點字顯示器安裝 WinUSB 驅動程式。\n"
+                "（這是一次性操作，需要系統管理員權限，會出現 UAC 視窗。）\n\n"
+                "立即安裝嗎？",
+                "MetecBD - 驅動程式安裝",
+                wx.YES_NO | wx.ICON_QUESTION,
+            )
+            result = dlg.ShowModal()
+            dlg.Destroy()
+            log.info(f"MetecBD installTasks: prompt result={result!r} (wx.ID_YES={wx.ID_YES!r})")
+            if result == wx.ID_YES:
+                _install_winusb()
+        except Exception:
+            log.exception("MetecBD installTasks: unexpected error in install prompt")
 
     wx.CallAfter(_prompt)
