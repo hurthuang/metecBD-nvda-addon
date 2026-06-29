@@ -21,9 +21,13 @@ import threading
 import time
 import winreg
 import uuid as _uuid
+import json
+import os
 
 import braille
 import inputCore
+import addonHandler
+addonHandler.initTranslation()
 from logHandler import log
 
 # ─── DLL handles ─────────────────────────────────────────────────────────────
@@ -69,7 +73,40 @@ _BIT_REV = bytes(
     for b in range(256)
 )
 
+def get_config_path():
+    try:
+        from NVDAState import WritePaths
+        config_dir = WritePaths.configDir
+    except ImportError:
+        config_dir = os.path.dirname(__file__)
+    return os.path.join(config_dir, "metecBD_config.json")
+
+def load_timeout() -> int:
+    path = get_config_path()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return int(data.get("idle_timeout_s", 18))
+    except Exception:
+        pass
+    return 18  # default to 18 seconds for testing
+
+def save_timeout(val: int):
+    path = get_config_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"idle_timeout_s": val}, f, indent=4)
+    except Exception:
+        pass
+
 # ─── ctypes structures ────────────────────────────────────────────────────────
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("dwTime", wintypes.DWORD),
+    ]
+
 class GUID(ctypes.Structure):
     _fields_ = [
         ("Data1", ctypes.c_ulong),
@@ -416,9 +453,18 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         self._key_mask     = None
         self._routing_key  = 0xFF
         self._fct_key      = 0
+        self._is_sleeping  = False
+        self._last_activity_time = time.monotonic()
+        timeout = load_timeout()
+        self._idle_timeout_s = timeout if timeout > 0 else 0x7FFFFFFF
+        inputCore.decide_executeGesture.register(self._on_gesture)
         self._open()
 
     def terminate(self):
+        try:
+            inputCore.decide_executeGesture.unregister(self._on_gesture)
+        except Exception:
+            pass
         self._close()
         super().terminate()
 
@@ -680,6 +726,12 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         with self._lock:
             if not self._usb_handle:
                 return
+            if self._is_sleeping:
+                # Store it so we can restore when waking up
+                rev = bytes(_BIT_REV[b] for b in raw[:NUM_CELLS])
+                total = self._num_modules * MODULE_SIZE
+                self._last_cells = (rev + bytes(total))[:total]
+                return
             self._write_cells(raw)
 
     def _write_cells(self, raw):
@@ -735,6 +787,7 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
             pkt = self._ctrl_in(REQ_STATUS, MT_STATUS_SIZE)
             if pkt and len(pkt) >= 4:
                 self._dispatch(pkt)
+            self._check_idle_state()
             time.sleep(POLL_MS / 1000)
 
     # ── Gesture dispatch ───────────────────────────────────────────────────────
@@ -753,6 +806,9 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         if routing_key != 0xFF:
             self._routing_key = routing_key
         self._fct_key |= fct_key
+
+        if fct_key > 0 or routing_key != 0xFF:
+            self._last_activity_time = time.monotonic()
 
         if (self._fct_key or self._routing_key != 0xFF) \
                 and fct_key == 0 and routing_key == 0xFF:
@@ -783,6 +839,69 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
                 inputCore.manager.executeGesture(InputGesture(keys=names))
         except inputCore.NoInputGestureAction:
             pass
+
+    def _on_gesture(self, gesture):
+        self._last_activity_time = time.monotonic()
+        return True
+
+    def set_idle_timeout(self, val):
+        self._last_activity_time = time.monotonic()
+        if val == 0 or val is None:
+            self._idle_timeout_s = 0x7FFFFFFF  # Disable sleep
+            if self._is_sleeping:
+                with self._lock:
+                    if self._usb_handle:
+                        self._wake_device()
+        else:
+            self._idle_timeout_s = val
+            # If current idle duration is less than the new timeout, wake up
+            idle_duration = time.monotonic() - self._last_activity_time
+            if self._is_sleeping and idle_duration < self._idle_timeout_s:
+                with self._lock:
+                    if self._usb_handle:
+                        self._wake_device()
+
+    def _check_idle_state(self):
+        now = time.monotonic()
+        lii = LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            tick_count = ctypes.windll.kernel32.GetTickCount()
+            win_idle_ms = tick_count - lii.dwTime
+            if win_idle_ms < 0:
+                win_idle_ms += 0x100000000
+            if win_idle_ms < 1000:
+                self._last_activity_time = now
+        
+        idle_duration = now - self._last_activity_time
+        if idle_duration >= self._idle_timeout_s:
+            if not self._is_sleeping:
+                with self._lock:
+                    if self._usb_handle:
+                        self._sleep_device()
+        else:
+            if self._is_sleeping:
+                with self._lock:
+                    if self._usb_handle:
+                        self._wake_device()
+
+    def _sleep_device(self):
+        log.info("MetecBD: Idle timeout reached. Putting braille display to sleep.")
+        self._is_sleeping = True
+        zeros = bytes(self._num_modules * MODULE_SIZE)
+        for mod in range(self._num_modules):
+            chunk = zeros[mod * MODULE_SIZE : (mod + 1) * MODULE_SIZE]
+            self._ctrl_out(REQ_MODULE_BASE + mod, chunk)
+        self._ctrl_out(REQ_HIGH_VOLTAGE, bytes(8))
+
+    def _wake_device(self):
+        log.info("MetecBD: Activity detected. Waking up braille display.")
+        self._is_sleeping = False
+        self._ctrl_out(REQ_HIGH_VOLTAGE, bytes([0xEF, 0, 0, 0, 0, 0, 0, 0]))
+        if self._last_cells:
+            for mod in range(self._num_modules):
+                chunk = self._last_cells[mod * MODULE_SIZE : (mod + 1) * MODULE_SIZE]
+                self._ctrl_out(REQ_MODULE_BASE + mod, chunk)
 
     gestureMap = inputCore.GlobalGestureMap({
         "globalCommands.GlobalCommands": {
