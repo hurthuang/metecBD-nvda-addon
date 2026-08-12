@@ -17,6 +17,7 @@ All control transfers use OVERLAPPED I/O (same as libusb-1.0 Windows backend).
 
 import ctypes
 import ctypes.wintypes as wintypes
+import subprocess
 import threading
 import time
 import winreg
@@ -30,6 +31,7 @@ from logHandler import log
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _api = ctypes.WinDLL("setupapi",  use_last_error=True)
 _usb = ctypes.WinDLL("winusb",    use_last_error=True)
+_cfg = ctypes.WinDLL("cfgmgr32",  use_last_error=True)
 
 # ─── Win32 constants ──────────────────────────────────────────────────────────
 GENERIC_RW            = 0xC0000000
@@ -39,8 +41,24 @@ FILE_FLAG_OVERLAPPED  = 0x40000000
 DIGCF_PRESENT         = 0x00000002
 DIGCF_DEVICEINTERFACE = 0x00000010
 ERROR_IO_PENDING      = 997
+ERROR_BAD_COMMAND     = 22    # USB STALL, surfaced via GetOverlappedResult
 WAIT_OBJECT_0         = 0x00000000
 INFINITE              = 0xFFFFFFFF
+CR_SUCCESS            = 0x00000000
+CM_LOCATE_DEVNODE_NORMAL = 0x00000000
+CM_REENUMERATE_NORMAL    = 0x00000000
+
+# Recovery tuning: how many consecutive status-poll failures (at 50 ms each)
+# before we try a soft reset, and how long to wait between reset attempts so
+# a genuinely unplugged device doesn't get hammered with reenumeration calls.
+MAX_CONSEC_STALL      = 6
+RECOVER_COOLDOWN_S    = 5.0
+REENUM_WAIT_S         = 5.0
+
+# Name of the scheduled task installTasks.py registers (SYSTEM, highest
+# privilege) at add-on install time. Triggering it via "schtasks /run" needs
+# no elevation of its own — see _soft_reset_device().
+REENUM_TASK = "MetecBD_ReenumUSB"
 
 # ─── Device / protocol parameters ────────────────────────────────────────────
 VENDOR_ID    = 0x0452
@@ -221,6 +239,16 @@ _usb.WinUsb_SetPipePolicy.argtypes = [
     ctypes.c_void_p,                   # Value
 ]
 
+# CM_Locate_DevNodeW / CM_Reenumerate_DevNode: used to force Windows to
+# re-enumerate the USB device (same bus-level reset a physical unplug/replug
+# triggers) without touching the cable. See _soft_reset_device().
+_cfg.CM_Locate_DevNodeW.restype  = ctypes.c_uint32
+_cfg.CM_Locate_DevNodeW.argtypes = [
+    ctypes.POINTER(ctypes.c_uint32), wintypes.LPCWSTR, ctypes.c_ulong]
+
+_cfg.CM_Reenumerate_DevNode.restype  = ctypes.c_uint32
+_cfg.CM_Reenumerate_DevNode.argtypes = [ctypes.c_uint32, ctypes.c_ulong]
+
 # ─── Device discovery ─────────────────────────────────────────────────────────
 def _str_to_guid(s):
     u = _uuid.UUID(s.strip("{}"))
@@ -380,6 +408,88 @@ def _get_device_service():
     return ""
 
 
+def _get_device_instance_id():
+    """Return e.g. 'USB\\VID_0452&PID_0100\\VER._0.9' for CM_Locate_DevNodeW."""
+    reg_path = (
+        rf"SYSTEM\CurrentControlSet\Enum\USB"
+        rf"\VID_{VENDOR_ID:04X}&PID_{PRODUCT_ID:04X}"
+    )
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
+    except OSError:
+        return None
+    with root:
+        try:
+            instance = winreg.EnumKey(root, 0)
+        except OSError:
+            return None
+    return rf"USB\VID_{VENDOR_ID:04X}&PID_{PRODUCT_ID:04X}\{instance}"
+
+
+def _soft_reset_device():
+    """Force Windows to tear down and re-enumerate the USB device — the same
+    bus-level reset a physical unplug/replug causes — without touching the
+    cable. This has been observed to be the only thing that clears a stuck
+    control endpoint (ControlTransfer failing with err=22/STALL forever);
+    closing and reopening the WinUSB handle alone does not clear it because
+    the endpoint state lives in the device firmware, not in Windows.
+    Returns True if reenumeration was successfully requested (not proof the
+    device actually came back — caller must poll _find_device_path after).
+
+    Tries the "MetecBD_ReenumUSB" scheduled task first (registered by
+    installTasks.py at add-on install time, running as SYSTEM/highest
+    privilege — triggering it via schtasks /run needs no elevation of its
+    own). Falls back to a direct CM_Reenumerate_DevNode call, which only
+    succeeds if this process already happens to be elevated."""
+    if _soft_reset_via_task():
+        return True
+    return _soft_reset_direct()
+
+
+def _soft_reset_via_task():
+    try:
+        result = subprocess.run(
+            ["schtasks", "/run", "/tn", REENUM_TASK],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        log.warning("MetecBD: soft reset — 無法執行 schtasks", exc_info=True)
+        return False
+
+    if result.returncode != 0:
+        log.warning(
+            f"MetecBD: soft reset — schtasks /run 失敗 rc={result.returncode} "
+            "（排程工作可能尚未註冊，需重新安裝附加元件）")
+        return False
+
+    log.info("MetecBD: soft reset 已透過排程工作觸發，等待裝置重新列舉…")
+    return True
+
+
+def _soft_reset_direct():
+    instance_id = _get_device_instance_id()
+    if not instance_id:
+        log.warning("MetecBD: soft reset — 找不到裝置 instance ID")
+        return False
+
+    dev_inst = ctypes.c_uint32(0)
+    cr = _cfg.CM_Locate_DevNodeW(
+        ctypes.byref(dev_inst), instance_id, CM_LOCATE_DEVNODE_NORMAL)
+    if cr != CR_SUCCESS:
+        log.warning(f"MetecBD: soft reset — CM_Locate_DevNodeW 失敗 cr={cr:#x}")
+        return False
+
+    cr = _cfg.CM_Reenumerate_DevNode(dev_inst.value, CM_REENUMERATE_NORMAL)
+    if cr != CR_SUCCESS:
+        log.warning(
+            f"MetecBD: soft reset — CM_Reenumerate_DevNode 失敗 cr={cr:#x}"
+            "（可能需要系統管理員權限才能重設此裝置）")
+        return False
+
+    log.info("MetecBD: soft reset 已直接觸發，等待裝置重新列舉…")
+    return True
+
+
 # ─── Gesture ──────────────────────────────────────────────────────────────────
 class InputGesture(braille.BrailleDisplayGesture):
     source = "metecBD"
@@ -416,6 +526,8 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         self._key_mask     = None
         self._routing_key  = 0xFF
         self._fct_key      = 0
+        self._consec_stall = 0
+        self._last_recover = 0.0
         self._open()
 
     def terminate(self):
@@ -423,7 +535,10 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         super().terminate()
 
     # ── open / close ──────────────────────────────────────────────────────────
-    def _open(self):
+    def _acquire_and_init(self):
+        """Find the device, open a WinUSB handle and run the init sequence.
+        Sets self._dev_handle / self._usb_handle on success. Shared by the
+        initial _open() and by recovery after a soft reset."""
         path = _find_device_path()
         if not path:
             raise RuntimeError(
@@ -458,6 +573,8 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 
         self._init_device()
 
+    def _open(self):
+        self._acquire_and_init()
         self._running = True
         self._thread = threading.Thread(
             target=self._poll_loop, name="MetecBD-Input", daemon=True)
@@ -734,8 +851,73 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         while self._running:
             pkt = self._ctrl_in(REQ_STATUS, MT_STATUS_SIZE)
             if pkt and len(pkt) >= 4:
+                self._consec_stall = 0
                 self._dispatch(pkt)
+            else:
+                self._consec_stall += 1
+                if self._consec_stall >= MAX_CONSEC_STALL:
+                    self._consec_stall = 0
+                    self._try_recover()
             time.sleep(POLL_MS / 1000)
+
+    # ── STALL recovery (soft reset, no physical replug) ────────────────────────
+    def _try_recover(self):
+        """Called from the poll thread after several consecutive status-read
+        failures. Known cause: the device's EP0 gets wedged and every further
+        ControlTransfer fails with err=22 (STALL) until the USB bus resets —
+        previously only fixable by physically unplugging/replugging. This
+        does the same reset in software via _soft_reset_device()."""
+        now = time.monotonic()
+        if now - self._last_recover < RECOVER_COOLDOWN_S:
+            return
+        self._last_recover = now
+        log.warning("MetecBD: status 讀取連續失敗，嘗試軟重置裝置（等同拔插重插）…")
+        with self._lock:
+            if not self._running:
+                return
+            self._reset_and_reconnect()
+
+    def _reset_and_reconnect(self):
+        """Must be called with self._lock held. Triggers a soft USB
+        reenumeration, waits for the device to come back, then reopens it.
+        Does NOT touch the existing handles until reenumeration is actually
+        confirmed to have been requested — if _soft_reset_device() fails
+        (e.g. access denied, since CM_Reenumerate_DevNode needs admin
+        rights), the old handles are left exactly as they were. Freeing them
+        pre-emptively would strand the driver on a null handle forever
+        (WinUSB calls fail with err=6/ERROR_INVALID_HANDLE instead of the
+        original err=22/STALL), which is worse than doing nothing."""
+        if not _soft_reset_device():
+            log.warning("MetecBD: 軟重置失敗，需要手動拔插 USB 線才能恢復")
+            return
+
+        # Reenumeration was accepted — Windows will tear the device node down,
+        # so these handles are about to become invalid regardless of what we
+        # do. Safe to release them now.
+        if self._usb_handle:
+            _usb.WinUsb_Free(ctypes.c_void_p(self._usb_handle))
+            self._usb_handle = None
+        if self._dev_handle:
+            _k32.CloseHandle(ctypes.c_void_p(self._dev_handle))
+            self._dev_handle = None
+
+        deadline = time.monotonic() + REENUM_WAIT_S
+        while time.monotonic() < deadline:
+            if not self._running:
+                return  # driver is being torn down (e.g. NVDA exiting) — bail out
+            time.sleep(0.2)
+            if _find_device_path():
+                break
+        else:
+            log.warning("MetecBD: 軟重置後等待逾時，裝置未重新出現")
+            return
+
+        try:
+            self._acquire_and_init()
+            self._last_cells = None  # force a full redraw on the next display()
+            log.info("MetecBD: 軟重置後重新連線成功")
+        except Exception:
+            log.warning("MetecBD: 軟重置後重新連線失敗", exc_info=True)
 
     # ── Gesture dispatch ───────────────────────────────────────────────────────
     def _dispatch(self, packet):
