@@ -13,6 +13,7 @@ $include = @(
     "manifest.ini",
     "installTasks.py",
     "brailleDisplayDrivers\metecBD.py",
+    "globalPlugins\metecBDConfig.py",
     "driver\MetecBD_WinUSB.inf"
 )
 
