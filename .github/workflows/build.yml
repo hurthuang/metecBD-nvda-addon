@@ -1,0 +1,31 @@
+name: Build add-on package
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest.ini
+        id: version
+        shell: pwsh
+        run: |
+          $raw = Get-Content manifest.ini -Raw
+          $null = $raw -match 'version\s*=\s*"?([^"\r\n]+)"?'
+          $version = $Matches[1].Trim()
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build .nvda-addon
+        shell: pwsh
+        run: tools\build_addon.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metecBD-${{ steps.version.outputs.version }}
+          path: "*.nvda-addon"
+          if-no-files-found: error
