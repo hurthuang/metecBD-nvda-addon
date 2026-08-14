@@ -839,7 +839,7 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
     # ── Braille output ─────────────────────────────────────────────────────────
     def display(self, cells):
         raw = bytes(cells[:NUM_CELLS]).ljust(NUM_CELLS, b'\x00')
-        log.info(f"MetecBD: display() cells[0]={raw[0]:#04x}")
+        log.debug(f"MetecBD: display() cells[0]={raw[0]:#04x}")
         with self._lock:
             if not self._usb_handle:
                 return
@@ -865,7 +865,7 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         # Protocol from BRLTTY braille.c:460-461:
         #   tellUsbDevice(brl, 0x0A + moduleNumber, cells, MT_MODULE_SIZE)
         # wValue=0, wIndex=0, data=8 bytes of bit-reversed cell values.
-        log.info(
+        log.debug(
             f"MetecBD: _write_cells {self._num_modules} modules "
             f"rev[0:4]={rev[0:4].hex()}")
         t0 = time.monotonic()
@@ -875,7 +875,7 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
             ok = self._ctrl_out(REQ_MODULE_BASE + mod, chunk)
             elapsed = int((time.monotonic() - t0) * 1000)
             if ok:
-                log.info(
+                log.debug(
                     f"MetecBD: mod {mod} req={REQ_MODULE_BASE+mod:#04x} "
                     f"OK ({elapsed}ms) data={chunk.hex()}")
             else:
@@ -892,7 +892,7 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 
         self._last_cells = rev
         elapsed = int((time.monotonic() - t0) * 1000)
-        log.info(f"MetecBD: _write_cells all modules OK ({elapsed}ms)")
+        log.debug(f"MetecBD: _write_cells all modules OK ({elapsed}ms)")
 
     # ── Key polling thread ─────────────────────────────────────────────────────
     def _poll_loop(self):
