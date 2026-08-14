@@ -1,4 +1,4 @@
-# build_addon.ps1 - 打包 MetecBD NVDA add-on
+﻿# build_addon.ps1 - 打包 MetecBD NVDA add-on
 # 用法：在 PowerShell 執行此腳本，產生 metecBD-0.1.0.nvda-addon
 
 $addonRoot = Split-Path $PSScriptRoot -Parent
