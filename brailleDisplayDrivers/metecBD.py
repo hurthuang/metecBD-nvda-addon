@@ -27,6 +27,8 @@ import os
 
 import braille
 import inputCore
+import tones
+import ui
 import addonHandler
 addonHandler.initTranslation()
 from logHandler import log
@@ -58,6 +60,14 @@ CM_REENUMERATE_NORMAL    = 0x00000000
 MAX_CONSEC_STALL      = 6
 RECOVER_COOLDOWN_S    = 5.0
 REENUM_WAIT_S         = 5.0
+
+# How many soft-reset attempts (each ~RECOVER_COOLDOWN_S apart) to let go by
+# silently before telling the user. A stuck EP0 can sometimes take a couple
+# of reenumeration cycles to clear, so this isn't "give up" — the retries
+# keep going regardless — it's just the point where staying silent stops
+# being reasonable and the user (who has no other way to know the display
+# went dead) needs to be told to unplug/replug.
+RECOVER_ALERT_THRESHOLD = 3
 
 # Name of the scheduled task installTasks.py registers (SYSTEM, highest
 # privilege) at add-on install time. Triggering it via "schtasks /run" needs
@@ -565,6 +575,8 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         self._fct_key      = 0
         self._consec_stall = 0
         self._last_recover = 0.0
+        self._recover_attempts = 0
+        self._recover_alerted = False
         self._is_sleeping  = False
         self._last_activity_time = time.monotonic()
         timeout = load_timeout()
@@ -904,6 +916,8 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
             pkt = self._ctrl_in(REQ_STATUS, MT_STATUS_SIZE)
             if pkt and len(pkt) >= 4:
                 self._consec_stall = 0
+                self._recover_attempts = 0
+                self._recover_alerted = False
                 self._dispatch(pkt)
             else:
                 self._consec_stall += 1
@@ -924,11 +938,38 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
         if now - self._last_recover < RECOVER_COOLDOWN_S:
             return
         self._last_recover = now
-        log.warning("MetecBD: status 讀取連續失敗，嘗試軟重置裝置（等同拔插重插）…")
+        self._recover_attempts += 1
+        log.warning(
+            f"MetecBD: status 讀取連續失敗，嘗試軟重置裝置（等同拔插重插）… "
+            f"(第 {self._recover_attempts} 次)")
+        if (self._recover_attempts >= RECOVER_ALERT_THRESHOLD
+                and not self._recover_alerted):
+            self._recover_alerted = True
+            self._notify_stuck()
         with self._lock:
             if not self._running:
                 return
             self._reset_and_reconnect()
+
+    def _notify_stuck(self):
+        """Tell the user the display has gone unresponsive. Auto-recovery
+        keeps retrying in the background regardless (some STALLs do clear
+        after a couple more reenumeration cycles), but silently retrying for
+        up to two minutes with zero feedback — which is what used to happen
+        — leaves a blind user with no way to know the display is dead versus
+        just not having new content. A tone fires even if speech is off or
+        busy; the message explains what's happening and what to do if it
+        doesn't clear on its own."""
+        try:
+            tones.beep(200, 200)
+        except Exception:
+            log.warning("MetecBD: tones.beep 失敗", exc_info=True)
+        try:
+            ui.message(_(
+                "點字顯示器沒有回應，正在自動嘗試恢復。"
+                "如果一直沒有恢復，請拔掉再插上顯示器的 USB 連接線。"))
+        except Exception:
+            log.warning("MetecBD: ui.message 失敗", exc_info=True)
 
     def _reset_and_reconnect(self):
         """Must be called with self._lock held. Triggers a soft USB

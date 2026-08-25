@@ -14,7 +14,8 @@ $include = @(
     "installTasks.py",
     "brailleDisplayDrivers\metecBD.py",
     "globalPlugins\metecBDConfig.py",
-    "driver\MetecBD_WinUSB.inf"
+    "driver\MetecBD_WinUSB.inf",
+    "driver\reenum_device.ps1"
 )
 
 if (Test-Path $outFile) { Remove-Item $outFile -Force }
