@@ -5,6 +5,7 @@ Metec BD / M30245 Starter Kit（25 格 USB 點字顯示器）的 NVDA 附加元�
 - 裝置：VID `0452` / PID `0100`
 - 純 Windows WinUSB API（透過 `ctypes`），**不需要安裝 BRLTTY 或任何外部 DLL**
 - 支援 Windows 11 / NVDA 2023.1 以上（已於 NVDA 2026.1 測試）
+- 版本異動請見 [CHANGELOG.md](CHANGELOG.md)
 
 ## 安裝步驟
 

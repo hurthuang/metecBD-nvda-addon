@@ -1008,17 +1008,35 @@ class BrailleDisplayDriver(braille.BrailleDisplayDriver):
 
         try:
             self._acquire_and_init()
-            self._last_cells = None  # force a full redraw on the next display()
-            # _init_device() unconditionally powers high voltage back on, so
-            # the hardware is awake regardless of what state it was in before
-            # the reset — resync our own idle-sleep tracking to match,
-            # otherwise display() would keep treating the device as asleep
-            # (just caching content instead of writing it) until the next
-            # real user-activity wake-up, even though the device is ready.
-            self._is_sleeping = False
-            log.info("MetecBD: 軟重置後重新連線成功")
         except Exception:
             log.warning("MetecBD: 軟重置後重新連線失敗", exc_info=True)
+            return
+
+        # _acquire_and_init() succeeding only proves a WinUSB handle could be
+        # opened and the init sequence ran — _init_device() logs
+        # ControlTransfer failures but never raises on them, so a device
+        # whose EP0 is still STALLed from before the reset "succeeds" here
+        # too (observed: _find_device_path() found the still-not-really-
+        # reenumerated device within ~200ms of triggering the reset, 9 times
+        # in a row, each logged as a successful reconnect while the display
+        # stayed dead). Confirm the endpoint actually responds with one more
+        # real status read before declaring victory.
+        status = self._ctrl_in(REQ_STATUS, MT_STATUS_SIZE)
+        if not status:
+            log.warning(
+                "MetecBD: 軟重置後裝置仍無回應（EP0 尚未真正恢復），"
+                "等待下一輪重試")
+            return
+
+        self._last_cells = None  # force a full redraw on the next display()
+        # _init_device() unconditionally powers high voltage back on, so
+        # the hardware is awake regardless of what state it was in before
+        # the reset — resync our own idle-sleep tracking to match,
+        # otherwise display() would keep treating the device as asleep
+        # (just caching content instead of writing it) until the next
+        # real user-activity wake-up, even though the device is ready.
+        self._is_sleeping = False
+        log.info("MetecBD: 軟重置後重新連線成功，EP0 已確認恢復回應")
 
     # ── Gesture dispatch ───────────────────────────────────────────────────────
     def _dispatch(self, packet):
