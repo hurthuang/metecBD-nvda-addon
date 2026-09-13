@@ -5,6 +5,9 @@ on:
     branches: [master]
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -29,3 +32,53 @@ jobs:
           name: metecBD-${{ steps.version.outputs.version }}
           path: "*.nvda-addon"
           if-no-files-found: error
+
+      # Only push-triggered builds on master create a tag + GitHub Release —
+      # workflow_dispatch runs (e.g. manual re-builds for testing) never do,
+      # so re-running the workflow by hand can't accidentally publish one.
+      - name: Skip release if tag already exists
+        id: check
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v${{ steps.version.outputs.version }}"
+          gh release view $tag *>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists, skipping."
+            "skip=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Extract this version's changelog section
+        if: github.event_name == 'push' && steps.check.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $capture = $false
+          $out = @()
+          foreach ($line in Get-Content CHANGELOG.md) {
+            if ($line -match '^## ') {
+              if ($capture) { break }
+              if ($line -match "^## $([regex]::Escape($version))(\s|$)") { $capture = $true }
+              continue
+            }
+            if ($capture) { $out += $line }
+          }
+          if ($out.Count -eq 0) { $out = @("(no changelog entry found for $version)") }
+          $out -join "`n" | Out-File -FilePath release_notes.md -Encoding utf8
+
+      - name: Create tag and GitHub Release
+        if: github.event_name == 'push' && steps.check.outputs.skip == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.check.outputs.tag }}"
+          $file = Get-ChildItem *.nvda-addon | Select-Object -First 1
+          git tag $tag
+          git push origin $tag
+          gh release create $tag $file.FullName --title $tag --notes-file release_notes.md
