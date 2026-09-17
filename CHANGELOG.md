@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.10
+
+- 修正軟重置第一層（排程工作觸發）在 NVDA 下必定失敗的問題：`subprocess.run` 呼叫 `schtasks` 時沒有明確指定 `stdin`，而 NVDA 是沒有主控台的 GUI 程式，其繼承的 stdin handle 無效，導致 Python 在準備讓子行程繼承 handle 時直接拋出 `OSError: [WinError 6] 控制代碼無效`，整層復原機制形同虛設，直接跳到需要系統管理員權限才能成功的直接 `CM_Reenumerate_DevNode` 備援（在未提權執行的 NVDA 下必然失敗，`cr=0x33`）。實測中兩層皆失敗，只能手動拔插 USB 線才能恢復。修法是明確傳入 `stdin=subprocess.DEVNULL`，避免嘗試繼承無效 handle。
+
 ## 2.9
 
 - 修正 USB STALL 自動復原機制的「假成功」判斷：軟重置後，過去只要能重新開啟 WinUSB handle 並跑完初始化流程就記錄「重新連線成功」，但 `_init_device()` 對控制傳輸失敗只會寫警告、不會拋例外，導致 EP0 其實還卡在 STALL 狀態時也會誤報成功（實測連續出現 9 次假成功，顯示器實際上仍無回應）。現在會在確認 handle 可用後，再多做一次真正的 EP0 狀態讀取（`req=0x80`）驗證裝置真的有回應，才視為復原成功；否則記錄「裝置仍無回應」並等待下一輪重試。

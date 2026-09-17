@@ -497,7 +497,7 @@ def _soft_reset_via_task():
     try:
         result = subprocess.run(
             ["schtasks", "/run", "/tn", REENUM_TASK],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=10, stdin=subprocess.DEVNULL,
         )
     except Exception:
         log.warning("MetecBD: soft reset — 無法執行 schtasks", exc_info=True)
