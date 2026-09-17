@@ -45,13 +45,15 @@ jobs:
         run: |
           $tag = "v${{ steps.version.outputs.version }}"
           gh release view $tag *>$null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          if ($releaseExists) {
             Write-Host "Release $tag already exists, skipping."
             "skip=true" >> $env:GITHUB_OUTPUT
           } else {
             "skip=false" >> $env:GITHUB_OUTPUT
           }
           "tag=$tag" >> $env:GITHUB_OUTPUT
+          exit 0
 
       - name: Extract this version's changelog section
         if: github.event_name == 'push' && steps.check.outputs.skip == 'false'
